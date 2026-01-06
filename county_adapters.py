@@ -27,7 +27,7 @@ def lookup_property(county: str, parcel_id: str) -> Dict:
     elif county == "Manatee":
         return lookup_manatee(parcel_id)
     elif county == "Pasco":
-        return {'success': False, 'error': 'Pasco County lookup coming in Phase 2'}
+        return lookup_pasco(parcel_id)
     elif county == "Sarasota":
         return {'success': False, 'error': 'Sarasota County lookup coming in Phase 2'}
     else:
@@ -107,101 +107,201 @@ def lookup_hillsborough(parcel_id: str) -> Dict:
 
 def lookup_pinellas(parcel_id: str) -> Dict:
     """
-    Lookup property from Pinellas County using their direct API.
+    Lookup property from Pinellas County using their official Accela parcel service.
+    Uses related records to get complete property appraiser data.
     Parcel ID format: XX-XX-XX-XXXXX-XXX-XXXX
     Example: 03-32-16-11737-001-0010
     """
     
-    # Try Pinellas County's direct 2025 parcel layer first
-    pinellas_urls = [
-        "https://egis.pinellas.gov/arcgis/rest/services/PaoTpv/Parcels_2025/MapServer/0/query",
-        "https://www45.swfwmd.state.fl.us/arcgis12/rest/services/BaseVector/parcel_search/MapServer/13/query"
+    # Step 1: Query the Accela parcel layer
+    parcel_url = "https://egis.pinellas.gov/gis/rest/services/Accela/AccelaAddressParcel/MapServer/1/query"
+    
+    # Try with full qualified field names and without
+    field_variations = [
+        ('PGIS.PGIS.AccelaParcels.PARCELID', parcel_id),
+        ('PGIS.PGIS.Parcels.PARCELID', parcel_id),
+        ('PARCELID', parcel_id),
+        ('PIN', parcel_id),
     ]
     
-    # Create format variations
-    parcel_variations = [
-        parcel_id,  # With dashes: 03-32-16-11737-001-0010
-        parcel_id.replace('-', ''),  # Without dashes: 03321611737001010
+    parcel_data = None
+    object_id = None
+    
+    for field, value in field_variations:
+        params = {
+            'where': f"{field}='{value}'",
+            'outFields': '*',
+            'returnGeometry': 'false',
+            'f': 'json'
+        }
+        
+        try:
+            response = requests.get(parcel_url, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('features') and len(data['features']) > 0:
+                    parcel_data = data['features'][0]['attributes']
+                    object_id = parcel_data.get('PGIS.PGIS.Parcels.OBJECTID')
+                    break
+        except Exception:
+            continue
+    
+    if not parcel_data:
+        return {
+            'success': False,
+            'error': f'''Parcel {parcel_id} not found in Pinellas County GIS.
+
+Try: https://www.pcpao.gov/PropertyDetail?ParcelID={parcel_id}
+            '''
+        }
+    
+    # Step 2: Query related property appraiser records if available
+    pao_data = {}
+    if object_id:
+        try:
+            related_url = "https://egis.pinellas.gov/gis/rest/services/Accela/AccelaAddressParcel/MapServer/1/queryRelatedRecords"
+            related_params = {
+                'objectIds': str(object_id),
+                'relationshipId': '0',  # PGIS.PAOGENERAL relationship
+                'outFields': '*',
+                'f': 'json'
+            }
+            
+            response = requests.get(related_url, params=related_params, timeout=15)
+            if response.status_code == 200:
+                related_data = response.json()
+                if related_data.get('relatedRecordGroups'):
+                    for group in related_data['relatedRecordGroups']:
+                        if group.get('relatedRecords'):
+                            pao_data = group['relatedRecords'][0]['attributes']
+                            break
+        except Exception:
+            pass  # Continue with partial data
+    
+    # Combine data from both sources
+    return {
+        'success': True,
+        'address': pao_data.get('SITUSSTREET', ''),
+        'city': (parcel_data.get('PGIS.PGIS.AccelaParcels.JURISDICTION', '') or 
+                pao_data.get('SITUSCITY', '')),
+        'zip': pao_data.get('SITUSZIP', ''),
+        'owner': pao_data.get('OWNERNAME', ''),
+        'owner_address': pao_data.get('OWNERADD1', ''),
+        'owner_city': pao_data.get('OWNERCITY', ''),
+        'owner_state': pao_data.get('OWNERSTATE', ''),
+        'owner_zip': pao_data.get('OWNERZIP', ''),
+        'legal_description': (parcel_data.get('PGIS.PGIS.AccelaParcels.LEGAL', '') or
+                            pao_data.get('LEGALDESC', '')),
+        'legal_description2': '',
+        'acres': float(parcel_data.get('PGIS.PGIS.AccelaParcels.STATEDAREA', '0').split()[0] or 0),
+        'area_sqft': 0,
+        'zoning': parcel_data.get('PGIS.PGIS.AccelaParcels.ZONECLASS', 'Contact jurisdiction'),
+        'land_use': parcel_data.get('PGIS.PGIS.AccelaParcels.PROPOSEDLANDUSE', ''),
+        'land_use_code': parcel_data.get('PGIS.PGIS.AccelaParcels.PAO_USECODE', ''),
+        'assessed_land': pao_data.get('LANDVAL', 0),
+        'assessed_building': pao_data.get('BLDGVAL', 0),
+        'assessed_total': pao_data.get('JUSTVAL', 0),
+        'market_value': pao_data.get('ASMTVAL', 0),
+        'subdivision': parcel_data.get('PGIS.PGIS.AccelaParcels.SUBDIVISION', ''),
+        'block': parcel_data.get('PGIS.PGIS.AccelaParcels.BK', ''),
+        'lot': parcel_data.get('PGIS.PGIS.AccelaParcels.LOT', ''),
+        'section': parcel_data.get('PGIS.PGIS.AccelaParcels.SC', ''),
+        'township': parcel_data.get('PGIS.PGIS.AccelaParcels.TW', ''),
+        'range': parcel_data.get('PGIS.PGIS.AccelaParcels.RG', ''),
+        'year_built': pao_data.get('YRBLT', ''),
+        'num_buildings': pao_data.get('BLDGCNT', 0),
+        'num_units': pao_data.get('UNITS', 0),
+        'total_living_area': pao_data.get('TOTLIVAREA', 0),
+        'sale_date': pao_data.get('SALEDT1', ''),
+        'sale_amount': pao_data.get('SALEPRICE1', 0),
+        'parcel_link': f"https://www.pcpao.gov/PropertyDetail?ParcelID={parcel_id}",
+        'fema_flood_zone': parcel_data.get('PGIS.PGIS.AccelaParcels.FLOOD_ZONE', ''),
+        'error': None
+    }
+
+
+        '''
+    }
+
+
+def lookup_pasco(parcel_id: str) -> Dict:
+    """
+    Lookup property from Pasco County.
+    Uses SWFWMD regional service - same structure as Hillsborough.
+    Parcel ID format: XX-XX-XX-XX-XXX-XXX-XXXX
+    """
+    base_url = "https://www25.swfwmd.state.fl.us/arcgis12/rest/services/BaseVector/parcel_search/MapServer/12/query"
+    
+    # Normalize: remove dashes and spaces
+    parcel_normalized = parcel_id.replace('-', '').replace(' ', '')
+    
+    # Try both PARCELID and ALTKEY fields
+    query_attempts = [
+        ('PARCELID', parcel_id),
+        ('PARCELID', parcel_normalized),
+        ('ALTKEY', parcel_id),
+        ('ALTKEY', parcel_normalized),
     ]
     
-    # Try different field names that Pinellas uses
-    field_names = ['PARCELID', 'ALTKEY', 'PIN', 'PARNO']
-    
-    for base_url in pinellas_urls:
-        for parcel_variant in parcel_variations:
-            for field in field_names:
-                params = {
-                    'where': f"{field}='{parcel_variant}'",
-                    'outFields': '*',
-                    'returnGeometry': 'false',
-                    'f': 'json'
+    for field, value in query_attempts:
+        params = {
+            'where': f"{field}='{value}'",
+            'outFields': '*',
+            'returnGeometry': 'false',
+            'f': 'json'
+        }
+        
+        try:
+            response = requests.get(base_url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('features') and len(data['features']) > 0:
+                attr = data['features'][0]['attributes']
+                
+                return {
+                    'success': True,
+                    'address': attr.get('SITUSADD1', '') or attr.get('SITEADD', ''),
+                    'city': attr.get('SCITY', ''),
+                    'zip': attr.get('SZIP', ''),
+                    'owner': attr.get('OWNERNAME', ''),
+                    'owner_address': attr.get('OWNERADD1', ''),
+                    'owner_city': attr.get('OWNERCITY', ''),
+                    'owner_state': attr.get('OWNERSTATE', ''),
+                    'owner_zip': attr.get('OWNERZIP', ''),
+                    'legal_description': attr.get('LEGDECFULL', ''),
+                    'legal_description2': attr.get('LEGAL2', ''),
+                    'acres': attr.get('ACRES', 0),
+                    'area_sqft': attr.get('AREANO', 0),
+                    'zoning': attr.get('ZONING', 'Contact City/County for zoning info'),
+                    'land_use': attr.get('PARUSEDESC', ''),
+                    'land_use_code': attr.get('DOR4CODE', ''),
+                    'assessed_land': attr.get('ASSD_LND', 0),
+                    'assessed_building': attr.get('ASSD_BLD', 0),
+                    'assessed_total': attr.get('ASSD_TOT', 0),
+                    'market_value': attr.get('PARVAL', 0),
+                    'subdivision': attr.get('SUBDIV_NM', ''),
+                    'block': attr.get('BLOCK', ''),
+                    'lot': attr.get('LOT', ''),
+                    'section': attr.get('S_SECTION', ''),
+                    'township': attr.get('S_TOWNSHIP', ''),
+                    'range': attr.get('S_RANGE', ''),
+                    'year_built': attr.get('YRBLT_ACT', ''),
+                    'num_buildings': attr.get('NO_BULDNG', 0),
+                    'num_units': attr.get('NO_RES_UNITS', 0),
+                    'total_living_area': attr.get('TOT_LVG_AREA', 0),
+                    'sale_date': attr.get('SALE1_DATE', ''),
+                    'sale_amount': attr.get('SALE1_AMT', 0),
+                    'parcel_link': attr.get('PAWEBPAGE', ''),
+                    'error': None
                 }
-                
-                try:
-                    response = requests.get(base_url, params=params, timeout=15)
-                    if response.status_code != 200:
-                        continue
-                        
-                    data = response.json()
-                    
-                    if data.get('features') and len(data['features']) > 0:
-                        attr = data['features'][0]['attributes']
-                        
-                        # Handle different field names from different APIs
-                        return {
-                            'success': True,
-                            'address': (attr.get('SITUSADD1') or attr.get('SITEADD') or 
-                                      attr.get('SITUS_ADDRESS') or ''),
-                            'city': (attr.get('SCITY') or attr.get('SITUSCITY') or ''),
-                            'zip': (attr.get('SZIP') or attr.get('SITUSZIP') or ''),
-                            'owner': attr.get('OWNERNAME', ''),
-                            'owner_address': attr.get('OWNERADD1', ''),
-                            'owner_city': attr.get('OWNERCITY', ''),
-                            'owner_state': attr.get('OWNERSTATE', ''),
-                            'owner_zip': attr.get('OWNERZIP', ''),
-                            'legal_description': (attr.get('LEGDECFULL') or 
-                                                attr.get('LEGALDESC') or ''),
-                            'legal_description2': attr.get('LEGAL2', ''),
-                            'acres': attr.get('ACRES', 0),
-                            'area_sqft': (attr.get('AREANO') or attr.get('LOTSIZE') or 0),
-                            'zoning': attr.get('ZONING', 'Contact City/County for zoning info'),
-                            'land_use': (attr.get('PARUSEDESC') or attr.get('LANDUSE') or ''),
-                            'land_use_code': (attr.get('DOR4CODE') or attr.get('DOR_UC') or ''),
-                            'assessed_land': (attr.get('ASSD_LND') or attr.get('LANDVAL') or 0),
-                            'assessed_building': (attr.get('ASSD_BLD') or attr.get('BLDGVAL') or 0),
-                            'assessed_total': (attr.get('ASSD_TOT') or attr.get('JUSTVAL') or 0),
-                            'market_value': (attr.get('PARVAL') or attr.get('ASMTVAL') or 0),
-                            'subdivision': (attr.get('SUBDIV_NM') or attr.get('SUBDIVISION') or ''),
-                            'block': attr.get('BLOCK', ''),
-                            'lot': attr.get('LOT', ''),
-                            'section': (attr.get('S_SECTION') or attr.get('SECTION') or ''),
-                            'township': (attr.get('S_TOWNSHIP') or attr.get('TOWNSHIP') or ''),
-                            'range': (attr.get('S_RANGE') or attr.get('RANGE') or ''),
-                            'year_built': (attr.get('YRBLT_ACT') or attr.get('YRBUILT') or ''),
-                            'num_buildings': attr.get('NO_BULDNG', 0),
-                            'num_units': attr.get('NO_RES_UNITS', 0),
-                            'total_living_area': (attr.get('TOT_LVG_AREA') or 
-                                                attr.get('TOTLIVAREA') or 0),
-                            'sale_date': (attr.get('SALE1_DATE') or attr.get('SALEDT1') or ''),
-                            'sale_amount': (attr.get('SALE1_AMT') or attr.get('SALEPRICE1') or 0),
-                            'parcel_link': f"https://www.pcpao.gov/PropertyDetail?ParcelID={parcel_id}",
-                            'error': None
-                        }
-                
-                except Exception:
-                    continue  # Try next combination
+        
+        except Exception:
+            continue
     
-    # If not found, provide helpful error message
     return {
         'success': False,
-        'error': f'''Parcel {parcel_id} not found in available databases.
-
-Possible reasons:
-• The parcel may not be in the regional SWFWMD database yet
-• Try the direct link: https://www.pcpao.gov/PropertyDetail?ParcelID={parcel_id}
-
-If you can see the property on Pinellas County's website, please report this as a bug.
-        '''
+        'error': f'Parcel {parcel_id} not found in Pasco County database. Format: XX-XX-XX-XX-XXX-XXX-XXXX'
     }
 
 

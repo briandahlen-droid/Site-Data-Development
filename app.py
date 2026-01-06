@@ -165,8 +165,8 @@ with st.sidebar:
     st.subheader("Supported Counties")
     st.markdown("""
     - ✅ **Hillsborough** (Folio)
-    - ✅ **Pinellas**
-    - 🚧 **Pasco** (Coming Soon)
+    - ✅ **Pinellas** (Accela API)
+    - ✅ **Pasco**
     - ✅ **Manatee** (Folio)
     - 🚧 **Sarasota** (Coming Soon)
     """)
